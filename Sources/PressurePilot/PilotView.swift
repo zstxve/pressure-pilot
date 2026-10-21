@@ -54,6 +54,13 @@ struct PilotView: View {
                 .foregroundStyle(.secondary)
             }
 
+            if let url = pilot.statsURL {
+                Divider()
+                StatsSection(summary: pilot.summary) {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                }
+            }
+
             HStack {
                 if !pilot.frozen.isEmpty {
                     Button("Alle auftauen (\(pilot.frozen.count))") { pilot.thawAll() }
@@ -64,6 +71,41 @@ struct PilotView: View {
         }
         .padding(12)
         .frame(width: 420)
+    }
+}
+
+private struct StatsSection: View {
+    let summary: StatsSummary
+    let showRawData: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Letzte 7 Tage").bold().foregroundStyle(.primary)
+            Text("Gelb \(duration(summary.warnSeconds)) · Rot \(duration(summary.criticalSeconds))")
+            Text("Eingriffe: \(summary.interventions), davon \(summary.automatic) automatisch · \(formatBytes(summary.freedByQuit)) durch Beenden frei")
+            Text(episodes)
+            Button("Rohdaten zeigen", action: showRawData).buttonStyle(.link)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    /// Red phases with vs. without the pilot stepping in: the closest thing to a before/after comparison.
+    private var episodes: String {
+        let with = StatsSummary.average(summary.episodesWithAction)
+        let without = StatsSummary.average(summary.episodesWithoutAction)
+        guard with != nil || without != nil else { return "Noch keine rote Phase erlebt" }
+        let withText = with.map { "\(duration($0)) (\(summary.episodesWithAction.count)×)" } ?? "–"
+        let withoutText = without.map { "\(duration($0)) (\(summary.episodesWithoutAction.count)×)" } ?? "–"
+        return "Rote Phasen, Ø Dauer mit Eingriff: \(withText) · ohne: \(withoutText)"
+    }
+
+    private func duration(_ seconds: Int) -> String {
+        switch seconds {
+        case ..<60: "\(seconds) s"
+        case ..<3600: "\(seconds / 60) min"
+        default: "\(seconds / 3600) h \(seconds % 3600 / 60) min"
+        }
     }
 }
 

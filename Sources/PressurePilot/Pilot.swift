@@ -15,7 +15,7 @@ enum AppRule: String, CaseIterable, Identifiable {
     }
 }
 
-/// Escalation: yellow suggests via notification, red quits expendable apps one by one.
+/// Escalation: yellow suggests via notification, red freezes expendable apps one by one, then quits them.
 @MainActor
 final class Pilot: ObservableObject {
     @Published private(set) var level: PressureLevel = .normal
@@ -26,6 +26,7 @@ final class Pilot: ObservableObject {
     @Published private(set) var rules: [String: AppRule]
     @Published private(set) var loginStatus = SMAppService.mainApp.status
     @Published private(set) var frozen: [pid_t: [pid_t]] = [:]  // app pid -> its stopped processes
+    @Published private(set) var summary = StatsSummary()  // last 7 days
     @Published var autoQuit: Bool { didSet { UserDefaults.standard.set(autoQuit, forKey: "autoQuit") } }
     @Published var freezeFirst: Bool { didSet { UserDefaults.standard.set(freezeFirst, forKey: "freezeFirst") } }
     @Published var forceQuit: Bool { didSet { UserDefaults.standard.set(forceQuit, forKey: "forceQuit") } }
@@ -51,6 +52,12 @@ final class Pilot: ObservableObject {
     private var reportedLeaks: Set<pid_t> = []
     private var ticks = 0
     private var timer: Timer?
+    private lazy var statsLog: StatsLog? = simulated == nil ? StatsLog() : nil  // simulated pressure stays out
+    private var levelSeconds: [PressureLevel: Int] = [:]  // since the last sample
+    private var episodeStart: Date?  // current stretch of critical pressure
+    private var episodeActions = 0
+
+    var statsURL: URL? { statsLog?.url }
 
     init() {
         let defaults = UserDefaults.standard
@@ -135,6 +142,7 @@ final class Pilot: ObservableObject {
         thaw(app.pid)  // a stopped app can't handle the quit request
         guard NSRunningApplication(processIdentifier: app.pid)?.terminate() == true else { return }
         record("\(app.name) beendet (\(formatBytes(app.footprint)))" + (automatic ? ", automatisch" : ""))
+        logAction(.quit, app, automatic: automatic)
         if automatic {
             pending[app.pid] = Date()
             lastAutoAction = Date()
@@ -150,6 +158,7 @@ final class Pilot: ObservableObject {
         frozen[app.pid] = app.pids
         saveFrozen()
         record("\(app.name) eingefroren (\(formatBytes(app.footprint)))" + (automatic ? ", automatisch" : ""))
+        logAction(.freeze, app, automatic: automatic)
         if automatic {
             autoFrozen.insert(app.pid)
             lastAutoAction = Date()
@@ -183,6 +192,42 @@ final class Pilot: ObservableObject {
         UserDefaults.standard.set(frozen.values.flatMap { $0 }.map { Int($0) }, forKey: "frozenPIDs")
     }
 
+    private func logStat(_ entry: StatsEntry) {
+        guard let statsLog else { return }
+        statsLog.append(entry)
+        summary.add(entry)
+    }
+
+    private func logAction(_ kind: StatsEntry.Kind, _ app: AppUsage, automatic: Bool) {
+        if episodeStart != nil { episodeActions += 1 }
+        logStat(StatsEntry(kind: kind, app: app.name, footprint: app.footprint, automatic: automatic))
+    }
+
+    /// Time per pressure level, and how long each red phase lasted with or without the pilot stepping in.
+    private func trackStats() {
+        levelSeconds[level, default: 0] += 5
+        if level == .critical, episodeStart == nil {
+            episodeStart = Date()
+            episodeActions = 0
+        } else if level != .critical, let start = episodeStart {
+            logStat(StatsEntry(kind: .episode, duration: Int(Date().timeIntervalSince(start)), actions: episodeActions))
+            episodeStart = nil
+        }
+        if ticks % 12 == 0 {
+            logStat(StatsEntry(
+                kind: .sample,
+                warnSeconds: levelSeconds[.warn] ?? 0,
+                criticalSeconds: levelSeconds[.critical] ?? 0,
+                used: stats.used,
+                swap: stats.swapUsed
+            ))
+            levelSeconds = [:]
+        }
+        if ticks % 720 == 0 {  // hourly, so entries older than 7 days drop out of the summary
+            summary = StatsSummary(statsLog?.load(since: Date().addingTimeInterval(-7 * 86400)) ?? [])
+        }
+    }
+
     private func tick() {
         let previous = level
         level = simulated ?? .current()
@@ -193,6 +238,7 @@ final class Pilot: ObservableObject {
         skipped.formIntersection(alive)
         history = history.filter { alive.contains($0.key) }
         reportedLeaks.formIntersection(alive)
+        trackStats()
         if ticks % 12 == 0 { trackLeaks() }
         ticks += 1
 
@@ -225,6 +271,7 @@ final class Pilot: ObservableObject {
             guard let app = apps.first(where: { $0.pid == pid }) else { continue }
             reportedLeaks.insert(pid)
             record("\(app.name) wächst stetig (+\(formatBytes(rate))/h)")
+            logStat(StatsEntry(kind: .leak, app: app.name, footprint: app.footprint))
             Notifier.shared.post(
                 title: "\(app.name) wächst stetig",
                 body: "+\(formatBytes(rate)) pro Stunde, jetzt \(formatBytes(app.footprint)). Ein Neustart der App gibt den Speicher frei.",
@@ -239,6 +286,7 @@ final class Pilot: ObservableObject {
             if forceQuit, let app = apps.first(where: { $0.pid == pid }) {
                 NSRunningApplication(processIdentifier: pid)?.forceTerminate()
                 record("\(app.name) hart beendet")
+                logAction(.forceQuit, app, automatic: true)
             } else {
                 skipped.insert(pid)
             }
